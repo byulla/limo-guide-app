@@ -13,7 +13,7 @@ import 'package:vibration/vibration.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 
 // ★ 서버 주소: 시뮬레이터=localhost, 실기기=맥/로봇 IP
-const String serverUrl = 'ws://localhost:8765';
+const String serverUrl = 'ws://192.168.55.1:8765';
 
 // ===== 색상 (목업 팔레트) =====
 const cGreenBg = Color(0xFFEAF3DE);
