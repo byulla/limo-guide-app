@@ -2,6 +2,12 @@
 // 화면: 메인(연결배지·위험카드·마지막발화·정지버튼) + 설정(거리·속도·주기·진동)
 // 설정값은 실제 동작에 반영되고 기기에 저장됨
 //
+// [2026-07-28 수정] 재연결 폭발 버그 수정:
+//   - onError/onDone 양쪽에서 재연결을 예약해 시도가 2배씩 불어나던 문제 → onDone에서만 처리
+//   - 재연결 타이머 단일화(_reconnectTimer)로 중복 예약 원천 차단
+//   - channel.ready로 연결 성공을 즉시 감지 (첫 메시지 전에도 초록 배지)
+//   - dispose 시 타이머 정리
+//
 // 설치: flutter pub add flutter_tts vibration web_socket_channel shared_preferences
 
 import 'dart:async';
@@ -13,7 +19,7 @@ import 'package:vibration/vibration.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 
 // ★ 서버 주소: 시뮬레이터=localhost, 실기기=맥/로봇 IP
-const String serverUrl = 'ws://192.168.55.1:8765';
+const String serverUrl = 'ws://10.42.0.1:8765';
 
 // ===== 색상 (목업 팔레트) =====
 const cGreenBg = Color(0xFFEAF3DE);
@@ -91,6 +97,9 @@ class _MainScreenState extends State<MainScreen> {
   String _prevSentence = '';
   DateTime _prevTime = DateTime.fromMillisecondsSinceEpoch(0);
 
+  // [수정] 재연결 타이머 단일화 — 이미 예약돼 있으면 새로 예약하지 않음
+  Timer? _reconnectTimer;
+
   static const typeKo = {
     'person': '사람', 'chair': '의자', 'box': '상자',
     'door': '문', 'obstacle': '장애물', 'stairs': '계단',
@@ -110,26 +119,48 @@ class _MainScreenState extends State<MainScreen> {
     tts.setSpeechRate(0.5 * settings.speechRate);
   }
 
-  void _connect() {
+  // [수정] 연결 로직 전면 교체
+  void _connect() { print("### 연결 시도: $serverUrl");
+    _reconnectTimer?.cancel();
     try {
-      channel = WebSocketChannel.connect(Uri.parse(serverUrl));
-      channel!.stream.listen(
+      final ch = WebSocketChannel.connect(Uri.parse(serverUrl));
+      channel = ch;
+
+      // 연결 성공을 즉시 감지 (첫 메시지 오기 전에도 배지 초록)
+      ch.ready.then((_) {
+        if (mounted) setState(() => connected = true);
+      }).catchError((e) { print("### ready 실패: $e");
+        // 접속 실패 — 재연결은 onDone에서 한 번만 예약되므로 여기선 아무것도 안 함
+      });
+
+      ch.stream.listen(
             (data) {
-          if (!connected) setState(() => connected = true);
+          if (!connected && mounted) setState(() => connected = true);
           _onMessage(jsonDecode(data as String) as Map<String, dynamic>);
         },
+        // [수정] 핵심: 재연결 예약은 onDone에서만!
+        // (에러가 나면 스트림이 닫히면서 onDone도 불리므로,
+        //  onError에서도 예약하면 시도가 2배씩 불어나 포트 고갈 폭발이 남)
         onDone: _onDisconnected,
-        onError: (_) => _onDisconnected(),
+        onError: (e) { print("### 스트림 에러: $e"); },
+        cancelOnError: false,
       );
     } catch (_) {
-      _onDisconnected();
+      _scheduleReconnect();
     }
   }
 
-  void _onDisconnected() {
+  void _onDisconnected() { print("### 연결 끊김/실패");
     if (connected) _speak('연결이 끊어져 정지했습니다.', urgent: true);
-    setState(() => connected = false);
-    Future.delayed(const Duration(seconds: 3), _connect);
+    if (mounted) setState(() => connected = false);
+    _scheduleReconnect();
+  }
+
+  // [수정] 중복 예약 방지 가드 — 3초에 딱 한 번만 재시도
+  void _scheduleReconnect() {
+    if (!mounted) return;
+    if (_reconnectTimer?.isActive ?? false) return; // 이미 예약됨 → 무시
+    _reconnectTimer = Timer(const Duration(seconds: 3), _connect);
   }
 
   void _onMessage(Map<String, dynamic> msg) {
@@ -313,6 +344,7 @@ class _MainScreenState extends State<MainScreen> {
 
   @override
   void dispose() {
+    _reconnectTimer?.cancel(); // [수정] 타이머 정리
     channel?.sink.close();
     tts.stop();
     super.dispose();
