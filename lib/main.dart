@@ -34,7 +34,7 @@ const cDark = Color(0xFF2C2C2A);
 
 // ===== 설정 (저장/로드) =====
 class Settings {
-  double warnDistance = 1.5;   // 경고 시작 거리 (m)
+  double warnDistance = 1.0;   // 경고 시작 거리 (m)
   double speechRate = 1.0;     // 음성 속도 (배)
   int repeatGapSec = 3;        // 안내 반복 주기 (초)
   bool vibrate = true;         // 진동 알림
@@ -42,7 +42,7 @@ class Settings {
 
   Future<void> load() async {
     final p = await SharedPreferences.getInstance();
-    warnDistance = p.getDouble('warnDistance') ?? 1.5;
+    warnDistance = p.getDouble('warnDistance') ?? 1.0;
     speechRate = p.getDouble('speechRate') ?? 1.0;
     repeatGapSec = p.getInt('repeatGapSec') ?? 3;
     vibrate = p.getBool('vibrate') ?? true;
@@ -104,14 +104,53 @@ class _MainScreenState extends State<MainScreen> {
     'person': '사람', 'chair': '의자', 'box': '상자',
     'door': '문', 'obstacle': '장애물', 'stairs': '계단',
   };
+  // YOLO 클래스명 → 한국어 (융합 서버의 label 필드용)
+  static const labelKo = {
+    'person': '사람', 'backpack': '가방', 'chair': '의자',
+    'suitcase': '캐리어', 'potted plant': '화분', 'tv': '모니터',
+    'bench': '벤치', 'couch': '소파',
+  };
   static const dirKo = {'front': '전방', 'left': '왼쪽', 'right': '오른쪽'};
+
+  // 받침 유무에 따라 이/가 선택 (사람이 / 의자가)
+  static String josa(String w) {
+    if (w.isEmpty) return '이';
+    final c = w.codeUnitAt(w.length - 1);
+    if (c < 0xAC00 || c > 0xD7A3) return '이';
+    return (c - 0xAC00) % 28 == 0 ? '가' : '이';
+  }
 
   @override
   void initState() {
     super.initState();
     tts.setLanguage('ko-KR');
     _applySpeechRate();
+    // TTS 예열을 백그라운드로 — 실패/지연해도 앱 시작을 막지 않음
+    Future(() => _warmUpTts()).timeout(
+      const Duration(seconds: 3),
+      onTimeout: () => tts.setVolume(1.0),
+    ).catchError((_) => tts.setVolume(1.0));
     _connect();
+  }
+
+  // 앱 시작 시 TTS 엔진 예열: 무음 발화로 iOS 오디오 세션을 미리 활성화해
+  // 실제 안내 시 발화 시작 지연(300~500ms)을 줄인다.
+  Future<void> _warmUpTts() async {
+    try {
+      await tts.awaitSpeakCompletion(false); // speak가 발화 끝을 기다리지 않게
+      await tts.setSharedInstance(true);
+      await tts.setIosAudioCategory(
+        IosTextToSpeechAudioCategory.playback,
+        [IosTextToSpeechAudioCategoryOptions.mixWithOthers],
+      );
+      await tts.setVolume(0.0); // 무음으로
+      await tts.speak('안내 준비'); // 엔진 첫 시동 (들리지 않음)
+      await Future.delayed(const Duration(milliseconds: 600));
+      await tts.stop();
+      await tts.setVolume(1.0); // 볼륨 복원
+    } catch (_) {
+      await tts.setVolume(1.0); // 어떤 경우에도 볼륨은 복원
+    }
   }
 
   void _applySpeechRate() {
@@ -121,39 +160,39 @@ class _MainScreenState extends State<MainScreen> {
 
   // [수정] 연결 로직 전면 교체
   void _connect() { print("### 연결 시도: $serverUrl");
-    _reconnectTimer?.cancel();
-    try {
-      final ch = WebSocketChannel.connect(Uri.parse(serverUrl));
-      channel = ch;
+  _reconnectTimer?.cancel();
+  try {
+    final ch = WebSocketChannel.connect(Uri.parse(serverUrl));
+    channel = ch;
 
-      // 연결 성공을 즉시 감지 (첫 메시지 오기 전에도 배지 초록)
-      ch.ready.then((_) {
-        if (mounted) setState(() => connected = true);
-      }).catchError((e) { print("### ready 실패: $e");
-        // 접속 실패 — 재연결은 onDone에서 한 번만 예약되므로 여기선 아무것도 안 함
-      });
+    // 연결 성공을 즉시 감지 (첫 메시지 오기 전에도 배지 초록)
+    ch.ready.then((_) {
+      if (mounted) setState(() => connected = true);
+    }).catchError((e) { print("### ready 실패: $e");
+      // 접속 실패 — 재연결은 onDone에서 한 번만 예약되므로 여기선 아무것도 안 함
+    });
 
-      ch.stream.listen(
-            (data) {
-          if (!connected && mounted) setState(() => connected = true);
-          _onMessage(jsonDecode(data as String) as Map<String, dynamic>);
-        },
-        // [수정] 핵심: 재연결 예약은 onDone에서만!
-        // (에러가 나면 스트림이 닫히면서 onDone도 불리므로,
-        //  onError에서도 예약하면 시도가 2배씩 불어나 포트 고갈 폭발이 남)
-        onDone: _onDisconnected,
-        onError: (e) { print("### 스트림 에러: $e"); },
-        cancelOnError: false,
-      );
-    } catch (_) {
-      _scheduleReconnect();
-    }
+    ch.stream.listen(
+          (data) {
+        if (!connected && mounted) setState(() => connected = true);
+        _onMessage(jsonDecode(data as String) as Map<String, dynamic>);
+      },
+      // [수정] 핵심: 재연결 예약은 onDone에서만!
+      // (에러가 나면 스트림이 닫히면서 onDone도 불리므로,
+      //  onError에서도 예약하면 시도가 2배씩 불어나 포트 고갈 폭발이 남)
+      onDone: _onDisconnected,
+      onError: (e) { print("### 스트림 에러: $e"); },
+      cancelOnError: false,
+    );
+  } catch (_) {
+    _scheduleReconnect();
+  }
   }
 
   void _onDisconnected() { print("### 연결 끊김/실패");
-    if (connected) _speak('연결이 끊어져 정지했습니다.', urgent: true);
-    if (mounted) setState(() => connected = false);
-    _scheduleReconnect();
+  if (connected) _speak('연결이 끊어져 정지했습니다.', urgent: true);
+  if (mounted) setState(() => connected = false);
+  _scheduleReconnect();
   }
 
   // [수정] 중복 예약 방지 가드 — 3초에 딱 한 번만 재시도
@@ -163,32 +202,65 @@ class _MainScreenState extends State<MainScreen> {
     _reconnectTimer = Timer(const Duration(seconds: 3), _connect);
   }
 
+  // 직전 발화 내용 기억 (변화 감지용)
+  String _prevType = '';
+  String _prevDir = '';
+  double _prevDist = 99.0;
+
   void _onMessage(Map<String, dynamic> msg) {
-    setState(() => lastMsg = msg);
     if (!guiding) return;
 
     final dist = (msg['distance'] as num?)?.toDouble() ?? 99.0;
     var urgency = msg['urgency'] as String? ?? 'info';
 
-    // 설정값 반영: 거리 기준으로 로컬 판정 보정
+    // 설정값 반영: 거리 기준으로 로컬 판정
     if (msg['type'] != 'none') {
       if (dist <= settings.emergencyDistance) {
         urgency = 'emergency';
-      } else if (dist > settings.warnDistance && urgency == 'warn') {
-        urgency = 'info'; // 경고 시작 거리 밖이면 조용한 안내로 강등
+      } else if (dist > settings.warnDistance) {
+        urgency = 'safe'; // 경고 거리 밖 = 화면·음성 모두 안전 (통일)
       }
     }
-    if (urgency == 'safe') return;
 
-    final type = typeKo[msg['type']] ?? '장애물';
+    // ── 안전: 화면을 안전 상태로, 음성 없음 ──
+    if (urgency == 'safe' || msg['type'] == 'none') {
+      _prevType = '';
+      _prevDir = '';
+      _prevDist = 99.0;
+      setState(() => lastMsg = {'type': 'none'});
+      return;
+    }
+
+    final label = msg['label'] as String? ?? '';
+    final type = labelKo[label] ?? typeKo[msg['type']] ?? '장애물';
     final dir = dirKo[msg['direction']] ?? '전방';
+
+    // ── 발화 조건: 내용 변화(물체/방향/거리 0.3m) 또는 반복 주기 경과 ──
+    final changed = type != _prevType ||
+        dir != _prevDir ||
+        (dist - _prevDist).abs() >= 0.3;
+    final gapOver = DateTime.now().difference(_prevTime) >
+        Duration(seconds: settings.repeatGapSec);
+    if (!changed && !gapOver && urgency != 'emergency') {
+      return; // 화면도 음성도 그대로 유지 (마지막 발화 상태 고정)
+    }
+
     final sentence = urgency == 'emergency'
-        ? '정지하세요! $dir 바로 앞에 $type!'
-        : '$dir ${dist.toStringAsFixed(1)}미터에 $type이 있습니다';
+        ? '정지! $dir $type!'
+        : '$dir ${dist.toStringAsFixed(1)}미터 $type';
 
-    _speak(sentence, urgent: urgency == 'emergency');
+    _prevType = type;
+    _prevDir = dir;
+    _prevDist = dist;
 
-    if (settings.vibrate && urgency != 'info') {
+    // ── 화면 갱신과 발화를 반드시 같은 순간, 같은 내용으로 ──
+    setState(() {
+      lastMsg = msg;
+      lastSpoken = sentence;
+    });
+    _speakNow(sentence);
+
+    if (settings.vibrate) {
       Vibration.hasVibrator().then((has) {
         if (has == true) {
           Vibration.vibrate(duration: urgency == 'emergency' ? 800 : 300);
@@ -197,15 +269,14 @@ class _MainScreenState extends State<MainScreen> {
     }
   }
 
+  // 낡은 발화를 끊고 최신 정보를 즉시 말함 (시간차 최소화)
+  Future<void> _speakNow(String sentence) async {
+    _prevTime = DateTime.now();
+    await tts.stop();
+    await tts.speak(sentence);
+  }
+
   Future<void> _speak(String sentence, {bool urgent = false}) async {
-    final now = DateTime.now();
-    if (!urgent &&
-        sentence == _prevSentence &&
-        now.difference(_prevTime) < Duration(seconds: settings.repeatGapSec)) {
-      return;
-    }
-    _prevSentence = sentence;
-    _prevTime = now;
     if (urgent) await tts.stop();
     setState(() => lastSpoken = sentence);
     await tts.speak(sentence);
@@ -289,7 +360,7 @@ class _MainScreenState extends State<MainScreen> {
                     Text(
                       lastMsg == null || lastMsg!['type'] == 'none'
                           ? ''
-                          : (typeKo[lastMsg!['type']] ?? '장애물'),
+                          : (labelKo[lastMsg!['label'] ?? ''] ?? typeKo[lastMsg!['type']] ?? '장애물'),
                       style: TextStyle(
                           fontSize: 26, fontWeight: FontWeight.bold, color: subColor),
                     ),
