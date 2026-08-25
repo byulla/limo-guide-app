@@ -17,3 +17,8 @@ Flutter iOS 앱. 연산은 전부 로봇 온보드 — 앱은 수신과 발화�
 flutter pub get && flutter run
 ```
 설정에서 `ws://<robot-ip>:8765` 입력 → "로봇 연결됨" 확인.
+
+## Contributors
+
+- 조예찬
+- 조혜라
